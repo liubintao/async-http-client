@@ -12,33 +12,57 @@
  */
 package org.asynchttpclient.extras.retrofit;
 
-import static org.asynchttpclient.extras.retrofit.AsyncHttpClientCall.*;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.*;
-import static org.testng.Assert.assertTrue;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.EmptyHttpHeaders;
+import lombok.*;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.asynchttpclient.AsyncCompletionHandler;
+import org.asynchttpclient.AsyncHttpClient;
+import org.asynchttpclient.AsyncHttpClientConfig;
+import org.asynchttpclient.BoundRequestBuilder;
+import org.asynchttpclient.DefaultAsyncHttpClientConfig;
+import org.asynchttpclient.Response;
+import org.mockito.ArgumentCaptor;
+import org.testng.Assert;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
-import lombok.val;
-import okhttp3.Request;
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.asynchttpclient.extras.retrofit.AsyncHttpClientCall.runConsumer;
+import static org.asynchttpclient.extras.retrofit.AsyncHttpClientCall.runConsumers;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotEquals;
+import static org.testng.Assert.assertTrue;
 
-import org.asynchttpclient.AsyncCompletionHandler;
-import org.asynchttpclient.AsyncHttpClient;
-import org.asynchttpclient.BoundRequestBuilder;
-import org.asynchttpclient.Response;
-import org.testng.Assert;
-import org.testng.annotations.DataProvider;
-import org.testng.annotations.Test;
-
+@Slf4j
 public class AsyncHttpClientCallTest {
     static final Request REQUEST = new Request.Builder().url("http://www.google.com/").build();
+    static final DefaultAsyncHttpClientConfig DEFAULT_AHC_CONFIG = new DefaultAsyncHttpClientConfig.Builder()
+            .setRequestTimeout(1_000)
+            .build();
+
+    private AsyncHttpClient httpClient;
+    private Supplier<AsyncHttpClient> httpClientSupplier = () -> httpClient;
+
+    @BeforeMethod
+    void setup() {
+      httpClient = mock(AsyncHttpClient.class);
+      when(httpClient.getConfig()).thenReturn(DEFAULT_AHC_CONFIG);
+    }
 
     @Test(expectedExceptions = NullPointerException.class, dataProvider = "first")
     void builderShouldThrowInCaseOfMissingProperties(AsyncHttpClientCall.AsyncHttpClientCallBuilder builder) {
@@ -47,12 +71,10 @@ public class AsyncHttpClientCallTest {
 
     @DataProvider(name = "first")
     Object[][] dataProviderFirst() {
-        val httpClient = mock(AsyncHttpClient.class);
-
         return new Object[][]{
                 {AsyncHttpClientCall.builder()},
                 {AsyncHttpClientCall.builder().request(REQUEST)},
-                {AsyncHttpClientCall.builder().httpClient(httpClient)}
+                {AsyncHttpClientCall.builder().httpClientSupplier(httpClientSupplier)}
         };
     }
 
@@ -70,7 +92,7 @@ public class AsyncHttpClientCallTest {
         val numRequestCustomizer = new AtomicInteger();
 
         // prepare http client mock
-        val httpClient = mock(AsyncHttpClient.class);
+        this.httpClient = mock(AsyncHttpClient.class);
 
         val mockRequest = mock(org.asynchttpclient.Request.class);
         when(mockRequest.getHeaders()).thenReturn(EmptyHttpHeaders.INSTANCE);
@@ -80,20 +102,19 @@ public class AsyncHttpClientCallTest {
 
         when(httpClient.executeRequest((org.asynchttpclient.Request) any(), any())).then(invocationOnMock -> {
             @SuppressWarnings("rawtypes")
-            val handler = invocationOnMock.getArgumentAt(1, AsyncCompletionHandler.class);
+            AsyncCompletionHandler<?> handler = invocationOnMock.getArgument(1);
             handlerConsumer.accept(handler);
             return null;
         });
 
         // create call instance
         val call = AsyncHttpClientCall.builder()
-                .httpClient(httpClient)
+                .httpClientSupplier(httpClientSupplier)
                 .request(REQUEST)
                 .onRequestStart(e -> numStarted.incrementAndGet())
                 .onRequestFailure(t -> numFailed.incrementAndGet())
                 .onRequestSuccess(r -> numOk.incrementAndGet())
                 .requestCustomizer(rb -> numRequestCustomizer.incrementAndGet())
-                .executeTimeoutMillis(1000)
                 .build();
 
         // when
@@ -156,7 +177,7 @@ public class AsyncHttpClientCallTest {
     void toIOExceptionShouldProduceExpectedResult(Throwable exception) {
         // given
         val call = AsyncHttpClientCall.builder()
-                .httpClient(mock(AsyncHttpClient.class))
+                .httpClientSupplier(httpClientSupplier)
                 .request(REQUEST)
                 .build();
 
@@ -223,6 +244,169 @@ public class AsyncHttpClientCallTest {
                 {Arrays.asList((Consumer<String>) s -> doThrow("trololo")), null},
                 {Arrays.asList((Consumer<String>) s -> doThrow("trololo")), "foo"},
         };
+    }
+
+    @Test
+    public void contentTypeHeaderIsPassedInRequest() throws Exception {
+        Request request = requestWithBody();
+
+        ArgumentCaptor<org.asynchttpclient.Request> capture = ArgumentCaptor.forClass(org.asynchttpclient.Request.class);
+
+        givenResponseIsProduced(httpClient, aResponse());
+
+        whenRequestIsMade(httpClient, request);
+
+        verify(httpClient).executeRequest(capture.capture(), any());
+
+        org.asynchttpclient.Request ahcRequest = capture.getValue();
+
+        assertTrue(ahcRequest.getHeaders().containsValue("accept", "application/vnd.hal+json", true),
+                "Accept header not found");
+        assertEquals(ahcRequest.getHeaders().get("content-type"), "application/json",
+                "Content-Type header not found");
+    }
+
+    @Test
+    public void contenTypeIsOptionalInResponse() throws Exception {
+        givenResponseIsProduced(httpClient, responseWithBody(null, "test"));
+
+        okhttp3.Response response = whenRequestIsMade(httpClient, REQUEST);
+
+        assertEquals(response.code(), 200);
+        assertEquals(response.header("Server"), "nginx");
+        assertEquals(response.body().contentType(), null);
+        assertEquals(response.body().string(), "test");
+    }
+
+    @Test
+    public void contentTypeIsProperlyParsedIfPresent() throws Exception {
+        givenResponseIsProduced(httpClient, responseWithBody("text/plain", "test"));
+
+        okhttp3.Response response = whenRequestIsMade(httpClient, REQUEST);
+
+        assertEquals(response.code(), 200);
+        assertEquals(response.header("Server"), "nginx");
+        assertEquals(response.body().contentType(), MediaType.parse("text/plain"));
+        assertEquals(response.body().string(), "test");
+
+    }
+
+    @Test
+    public void bodyIsNotNullInResponse() throws Exception {
+        givenResponseIsProduced(httpClient, responseWithNoBody());
+
+        okhttp3.Response response = whenRequestIsMade(httpClient, REQUEST);
+
+        assertEquals(response.code(), 200);
+        assertEquals(response.header("Server"), "nginx");
+        assertNotEquals(response.body(), null);
+    }
+
+    @Test(expectedExceptions = IllegalStateException.class, expectedExceptionsMessageRegExp = ".*returned null.")
+    void getHttpClientShouldThrowISEIfSupplierReturnsNull() {
+      // given:
+      val call = AsyncHttpClientCall.builder()
+              .httpClientSupplier(() -> null)
+              .request(requestWithBody())
+              .build();
+
+      // when: should throw ISE
+      call.getHttpClient();
+    }
+
+    @Test
+    void shouldReturnTimeoutSpecifiedInAHCInstanceConfig() {
+        // given:
+        val cfgBuilder = new DefaultAsyncHttpClientConfig.Builder();
+        AsyncHttpClientConfig config = null;
+
+        // and: setup call
+        val call = AsyncHttpClientCall.builder()
+                .httpClientSupplier(httpClientSupplier)
+                .request(requestWithBody())
+                .build();
+
+        // when: set read timeout to 5s, req timeout to 6s
+        config = cfgBuilder.setReadTimeout((int) SECONDS.toMillis(5))
+                .setRequestTimeout((int) SECONDS.toMillis(6))
+                .build();
+        when(httpClient.getConfig()).thenReturn(config);
+
+        // then: expect request timeout
+        assertEquals(call.getRequestTimeoutMillis(), SECONDS.toMillis(6));
+        assertEquals(call.timeout().timeoutNanos(), SECONDS.toNanos(6));
+
+        // when: set read timeout to 10 seconds, req timeout to 7s
+        config = cfgBuilder.setReadTimeout((int) SECONDS.toMillis(10))
+                .setRequestTimeout((int) SECONDS.toMillis(7))
+                .build();
+        when(httpClient.getConfig()).thenReturn(config);
+
+        // then: expect request timeout
+        assertEquals(call.getRequestTimeoutMillis(), SECONDS.toMillis(7));
+        assertEquals(call.timeout().timeoutNanos(), SECONDS.toNanos(7));
+
+        // when: set request timeout to a negative value, just for fun.
+        config = cfgBuilder.setRequestTimeout(-1000)
+                .setReadTimeout(2000)
+                .build();
+
+        when(httpClient.getConfig()).thenReturn(config);
+
+        // then: expect request timeout, but as positive value
+        assertEquals(call.getRequestTimeoutMillis(), SECONDS.toMillis(1));
+        assertEquals(call.timeout().timeoutNanos(), SECONDS.toNanos(1));
+    }
+
+    private void givenResponseIsProduced(AsyncHttpClient client, Response response) {
+        when(client.executeRequest(any(org.asynchttpclient.Request.class), any())).thenAnswer(invocation -> {
+            AsyncCompletionHandler<Response> handler = invocation.getArgument(1);
+            handler.onCompleted(response);
+            return null;
+        });
+    }
+
+    private okhttp3.Response whenRequestIsMade(AsyncHttpClient client, Request request) throws IOException {
+        return AsyncHttpClientCall.builder()
+                .httpClientSupplier(() -> client)
+                .request(request)
+                .build()
+                .execute();
+    }
+
+    private Request requestWithBody() {
+        return new Request.Builder()
+                .post(RequestBody.create(MediaType.parse("application/json"), "{\"hello\":\"world\"}".getBytes(StandardCharsets.UTF_8)))
+                .url("http://example.org/resource")
+                .addHeader("Accept", "application/vnd.hal+json")
+                .build();
+    }
+
+    private Response aResponse() {
+        Response response = mock(Response.class);
+        when(response.getStatusCode()).thenReturn(200);
+        when(response.getStatusText()).thenReturn("OK");
+        when(response.hasResponseHeaders()).thenReturn(true);
+        when(response.getHeaders()).thenReturn(new DefaultHttpHeaders()
+                .add("Server", "nginx")
+        );
+        when(response.hasResponseBody()).thenReturn(false);
+        return response;
+    }
+
+    private Response responseWithBody(String contentType, String content) {
+        Response response = aResponse();
+        when(response.hasResponseBody()).thenReturn(true);
+        when(response.getContentType()).thenReturn(contentType);
+        when(response.getResponseBodyAsBytes()).thenReturn(content.getBytes(StandardCharsets.UTF_8));
+        return response;
+    }
+
+    private Response responseWithNoBody() {
+        Response response = aResponse();
+        when(response.hasResponseBody()).thenReturn(false);
+        when(response.getContentType()).thenReturn(null);
+        return response;
     }
 
     private void doThrow(String message) {

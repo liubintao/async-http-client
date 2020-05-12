@@ -12,48 +12,79 @@
  */
 package org.asynchttpclient.extras.retrofit;
 
-import lombok.Builder;
-import lombok.NonNull;
-import lombok.Singular;
-import lombok.Value;
-import lombok.val;
+import lombok.*;
 import okhttp3.Call;
 import okhttp3.Request;
 import org.asynchttpclient.AsyncHttpClient;
 
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static org.asynchttpclient.extras.retrofit.AsyncHttpClientCall.runConsumers;
 
 /**
- * {@link AsyncHttpClient} implementation of Retrofit2 {@link Call.Factory}
+ * {@link AsyncHttpClient} implementation of <a href="http://square.github.io/retrofit/">Retrofit2</a>
+ * {@link Call.Factory}.
  */
 @Value
 @Builder(toBuilder = true)
 public class AsyncHttpClientCallFactory implements Call.Factory {
+  /**
+   * Supplier of {@link AsyncHttpClient}.
+   */
+  @NonNull
+  @Getter(AccessLevel.NONE)
+  Supplier<AsyncHttpClient> httpClientSupplier;
+
+  /**
+   * List of {@link Call} builder customizers that are invoked just before creating it.
+   */
+  @Singular("callCustomizer")
+  @Getter(AccessLevel.PACKAGE)
+  List<Consumer<AsyncHttpClientCall.AsyncHttpClientCallBuilder>> callCustomizers;
+
+  @Override
+  public Call newCall(Request request) {
+    val callBuilder = AsyncHttpClientCall.builder()
+            .httpClientSupplier(httpClientSupplier)
+            .request(request);
+
+    // customize builder before creating a call
+    runConsumers(this.callCustomizers, callBuilder);
+
+    // create a call
+    return callBuilder.build();
+  }
+
+  /**
+   * Returns {@link AsyncHttpClient} from {@link #httpClientSupplier}.
+   *
+   * @return http client.
+   */
+  AsyncHttpClient getHttpClient() {
+    return httpClientSupplier.get();
+  }
+
+  /**
+   * Builder for {@link AsyncHttpClientCallFactory}.
+   */
+  public static class AsyncHttpClientCallFactoryBuilder {
     /**
-     * {@link AsyncHttpClient} in use.
+     * {@link AsyncHttpClient} supplier that returns http client to be used to execute HTTP requests.
      */
-    @NonNull
-    AsyncHttpClient httpClient;
+    private Supplier<AsyncHttpClient> httpClientSupplier;
 
     /**
-     * List of {@link Call} builder customizers that are invoked just before creating it.
+     * Sets concrete http client to be used by the factory to execute HTTP requests. Invocation of this method
+     * overrides any previous http client supplier set by {@link #httpClientSupplier(Supplier)}!
+     *
+     * @param httpClient http client
+     * @return reference to itself.
+     * @see #httpClientSupplier(Supplier)
      */
-    @Singular("callCustomizer")
-    List<Consumer<AsyncHttpClientCall.AsyncHttpClientCallBuilder>> callCustomizers;
-
-    @Override
-    public Call newCall(Request request) {
-        val callBuilder = AsyncHttpClientCall.builder()
-                .httpClient(httpClient)
-                .request(request);
-
-        // customize builder before creating a call
-        runConsumers(this.callCustomizers, callBuilder);
-
-        // create a call
-        return callBuilder.build();
+    public AsyncHttpClientCallFactoryBuilder httpClient(@NonNull AsyncHttpClient httpClient) {
+      return httpClientSupplier(() -> httpClient);
     }
+  }
 }
